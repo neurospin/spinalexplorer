@@ -9,6 +9,7 @@
 
 # System import
 import os
+import re
 import subprocess
 import numpy
 from numpy import newaxis
@@ -21,7 +22,8 @@ from PIL import Image
 from slideio import PIL2array
 
 
-def affine_registration(slices, prefix="a", output_directory=None, verbose=1):
+def affine_registration(slices, prefix="a", output_directory=None,
+                        thr=20, verbose=1):
     """ Slice to slice affine registration using FSL.
 
     <process>
@@ -32,12 +34,20 @@ def affine_registration(slices, prefix="a", output_directory=None, verbose=1):
             prefix."/>
         <input name="output_directory" type="Directory" desc="The destination
             folder."/>
+        <input name="thr" type="Float" desc="A threshold used to detect
+            outliers based on the distance between center of masses."/>
         <input name="verbose" type="Int" desc="If greater than zero display
             debuging information, if greater than one display images."/>
     </process>
     """
+    # Compute the center of mass of the first image
+    array = nibabel.load(slices[0]).get_data()
+    indices = numpy.asarray(numpy.where(array != 0))
+    ref_center_of_mass = numpy.mean(indices, axis=1)
+
     # Go through each slice
     nb_slices = len(slices)
+    outliers = []
     for index in range(1, nb_slices):
 
         # Generate FSL command
@@ -54,13 +64,32 @@ def affine_registration(slices, prefix="a", output_directory=None, verbose=1):
         # Execute the FSL command
         returncode = subprocess.check_call(cmd)
 
-        # Save outputs
+        # Compute center of mass
         nifti_image = nibabel.load(outfile + ".nii.gz")
-        image = Image.fromarray(numpy.cast[numpy.uint8](nifti_image.get_data()))
-        image.save(outfile + ".tiff")
+        indices = numpy.asarray(numpy.where(nifti_image.get_data() != 0))
+        center_of_mass = numpy.mean(indices, axis=1)
+        distance = numpy.linalg.norm(ref_center_of_mass - center_of_mass)
+        if verbose > 0:
+            print "-" * 10
+            print "Distance: ", distance
+            print "-" * 10
 
-        # Update output
-        slices[index] = outfile + ".nii.gz"
+        # Save outputs and update output
+        if distance < thr:
+            ref_center_of_mass = center_of_mass
+            image = Image.fromarray(numpy.cast[numpy.uint8](
+                nifti_image.get_data()))
+            image.save(outfile + ".tiff")
+            slices[index] = outfile + ".nii.gz"
+        else:
+            os.remove(outfile + ".nii.gz")
+            outliers.append(slices[index])
+            slices[index] = slices[index - 1]
+
+    if verbose > 0:
+        print "-" * 10
+        print "Outliers: ", "\n".join(outliers)
+        print "-" * 10
 
     return slices
 
@@ -194,29 +223,45 @@ def flirt2aff_files(matfile, in_fname, ref_fname):
     return flirt2aff(mat, in_img, ref_img)
 
 
-def combine_deformations(ref_images, affine_trfs, nl_fields, prefix="low-",
-                         output_directory=None, verbose=1):
+def combine_deformations(ref_images, affine_trfs, nl_fields, ref_index,
+                         prefix="low-", output_directory=None, verbose=1):
     """ Combine an affine transformation with a non-linear field.
     """
+    # Create deformation mappings
+    affine_map = dict((re.findall(r"\d+", os.path.basename(f))[0], f)
+                      for f in affine_trfs)
+    nl_map = dict((re.findall(r"\d+", os.path.basename(f))[0], f)
+                      for f in nl_fields)
+
     # Go through all deformations
-    ref = ref_images[0]
+    ref = ref_images[ref_index]
     reference = nibabel.load(ref).get_data()
     ref_shape = reference.shape
     ref_affine = nibabel.load(ref).get_affine()
 
     ref_spacing = nibabel.load(ref).get_header()["pixdim"][1: 3]
     warped_images = []
-    for mov, affine, nl in zip(ref_images[1:], affine_trfs, nl_fields):
+    for mov in ref_images:
 
-        if verbose > 0:
-            print "-" * 10
-            print "Ref:", ref
-            print "Moving:", mov
-            print "Affine:", affine
-            print "Nl:", nl
+        # Check that this image was not an outlier
+        index = re.findall(r"\d+", os.path.basename(mov))[0]
+        if index in nl_map:
+            affine = affine_map[index]
+            nl = nl_map[index]
+
+            if verbose > 0:
+                print "-" * 10
+                print "Ref:", ref
+                print "Moving:", mov
+                print "Affine:", affine
+                print "Nl:", nl
+        else:
+            continue
 
         # Load moving image
-        moving = nibabel.load(mov).get_data()
+        moving_im = nibabel.load(mov)
+        moving = moving_im.get_data()
+        spacing = moving_im.get_header().get_zooms()
 
         # Load displacement field
         displacement = nibabel.load(nl).get_data()
@@ -234,19 +279,17 @@ def combine_deformations(ref_images, affine_trfs, nl_fields, prefix="low-",
 
         # Affine transform from reference index to the moving index
         A = numpy.dot(grid, ires[:3, :3].T) + ires[:3, 3]
-        A[..., 2] = 0
+        A = A[..., 0, :2]
 
         # Add the displacements
-        A[..., 0, 0] = A[..., 0, 0] + displacement[..., 1]
-        A[..., 0, 1] = A[..., 0, 1] + displacement[..., 0]
+        A[..., 0] += displacement[..., 1]
+        A[..., 1] += displacement[..., 0]
 
         # Do the interpolation using map coordinates
-        di, dj = ref_shape
-        dk = 1
-        dl = 3
-        moving.shape += (1, )
-        W = map_coordinates(moving, A.reshape(di * dj * dk, dl).T,
-                            order=1).reshape(di, dj, dk)[..., 0]
+        di, dj, dl = A.shape
+        W = map_coordinates(moving, A.reshape(di * dj , dl).T, order=1).reshape(
+            di, dj)
+        # W = apply_cv2_warp(displacement, reference, W, order=1)
 
         # Define output names
         fname = os.path.basename(mov).split(".")[0]
@@ -283,4 +326,24 @@ def apply_cv2_warp(warp, prev, next, order=1):
                              order=order).reshape(di, dj)
 
     return warped
+
+
+def register_t1_histo(t1_file, histo_file, prefix="f",
+                      output_directory=None, verbose=1):
+    """ Register the t1 and the histo.
+    """
+    fname = os.path.basename(histo_file).split(".")[0]
+    outfile = os.path.join(output_directory, prefix + fname)
+    trffile = os.path.join(output_directory, prefix + fname + ".trf")
+
+    if verbose > 0:
+        print "-" * 10
+        print "T1 file:", t1_file
+        print "Histo file:", histo_file
+        print "-" * 10
+
+    cmd = ["flirt", "-in", histo_file, "-ref", t1_file, "-out", outfile,
+           "-omat", trffile, "-dof", "12", "-cost", "normmi", "-usesqform",
+           "-v"]
+    subprocess.check_call(cmd)
 

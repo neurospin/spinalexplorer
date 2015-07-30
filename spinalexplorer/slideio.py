@@ -11,6 +11,7 @@
 import os
 import re
 import numpy
+import json
 
 # IO import
 import openslide
@@ -18,7 +19,7 @@ from PIL import Image
 import nibabel
 
 
-def get_slices(rootpath, regex, verbose=1):
+def get_slices(rootpath, regex, sanity=False, verbose=1):
     """ Get the ordered slices contained in a root folder.
 
     <process>
@@ -31,11 +32,22 @@ def get_slices(rootpath, regex, verbose=1):
             debuging information, if greater than one display images."/>
     </process>
     """
+    # Load the sanity file
+    if sanity:
+        sanity_file = os.path.join(rootpath, "sanity.json")
+        sanity = json.load(open(sanity_file, "r"))
+
     # Parse the rootpath
     slices = []
     for root, dirs, files in os.walk(rootpath):
-        slices.extend([os.path.join(rootpath, f) for f in files 
-                       if len(re.findall(regex, f)) > 0])
+        for fname in files:
+            if not sanity and len(re.findall(regex, fname)) > 0:
+                slices.append(os.path.join(root, fname))
+            elif len(re.findall(regex, fname)) > 0:
+                slice_number = fname.split(".")[0]
+                if slice_number in sanity and sanity[slice_number] == 1:
+                    slices.append(os.path.join(root, fname))
+
     
     # Order the slices
     slices = sorted(slices)
@@ -82,10 +94,13 @@ def downsample_slices(slices, downsample_factor=10, prefix="g",
     converted_slices = []
     for filename in slices:
 
+        if verbose > 0:
+            print "-" * 10
+            print "File:", filename
+
         # Open - downsample - grayscale
         slide = openslide.OpenSlide(filename)
         if verbose > 0:
-            print "-" * 10
             print "Nb of levels:", slide.level_count
             print "Level dims:", slide.level_dimensions
             print "Level downsamples:", slide.level_downsamples
@@ -96,7 +111,11 @@ def downsample_slices(slices, downsample_factor=10, prefix="g",
             print "-" * 10
         downsample_size = tuple(numpy.round(
             numpy.asarray(slide.level_dimensions[0]) / downsample_factor))
-        downsample_image = slide.get_thumbnail(downsample_size).convert("L")
+        try:
+            downsample_image = slide.get_thumbnail(downsample_size).convert("L")
+        except:
+            print "*** ERROR:", filename
+            raise
         spacing = numpy.array([
             float(slide.properties[openslide.PROPERTY_NAME_MPP_X]) * 1e-3,
             float(slide.properties[openslide.PROPERTY_NAME_MPP_X]) * 1e-3])
@@ -126,8 +145,8 @@ def PIL2array(image):
         image.size[1], image.size[0])
 
 
-def stack_slices(slices, slice_offset, prefix="v", output_directory=None,
-                 verbose=1):
+def stack_slices(slices, slice_offset, slice_orders=None, prefix="v",
+                 output_directory=None, verbose=1):
     """ Open a slice image with openslide, downsample it, create a grayscale
     image and save the result as '.tiff' and '.nii.gz' images.
 
@@ -137,6 +156,8 @@ def stack_slices(slices, slice_offset, prefix="v", output_directory=None,
         <input name="slices" type="List_File" desc="The slices to stack."/>
         <input name="slice_offset" type="Int" desc="Parameter specifying
             the slice to slice distance."/>
+        <input name="slice_orders" type="List" content="Str" desc="The
+            slice orders in the volume."/>
         <input name="prefix" type="Str" desc="The downsample output image
             prefix."/>
         <input name="output_directory" type="Directory" desc="The destination
@@ -159,16 +180,27 @@ def stack_slices(slices, slice_offset, prefix="v", output_directory=None,
     # Open, downsample and convert each slice
     slice_0 = nibabel.load(slices[0])
     spacing = slice_0.get_header()["pixdim"][1: 3].tolist() + [slice_offset, 1]
+    print spacing
     affine = numpy.diag(spacing)
-    volume_array = numpy.zeros(slice_0.get_shape() + (len(slices), ),
-                               dtype=numpy.uint8)
-    volume_array[..., 0] = slice_0.get_data()
-    for cnt, filename in enumerate(slices[1:]):
-        volume_array[..., cnt + 1] = nibabel.load(filename).get_data()
+
+    if slice_orders is not None:
+        volume_array = numpy.zeros(slice_0.get_shape() + (len(slice_orders), ),
+                                   dtype=numpy.uint8)
+        for filename in slices:
+            index = slice_orders.index(
+                re.findall(r"\d+", os.path.basename(filename))[0])
+            volume_array[..., index] = nibabel.load(filename).get_data()
+    else:
+        volume_array = numpy.zeros(slice_0.get_shape() + (len(slices), ),
+                                   dtype=numpy.uint8)
+        for cnt, filename in enumerate(slices):
+            volume_array[..., cnt] = nibabel.load(filename).get_data()
+
     volume = nibabel.Nifti1Image(volume_array, affine)
 
     # Save the output volume
     fname = os.path.basename(filename).split(".")[0]
+    fname = fname.replace(re.findall(r"\d+", fname)[0], "")
     volume_file = os.path.join(output_directory, prefix + fname + ".nii.gz") 
     nibabel.save(volume, volume_file)
 

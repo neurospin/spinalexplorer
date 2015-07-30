@@ -9,6 +9,7 @@
 
 # System import
 import os
+import bisect
 import numpy
 import nibabel
 from scipy import ndimage
@@ -67,6 +68,12 @@ def otsu_binarization(slices, min_blob_size=100, prefix="o",
     masked_slices = []
     for filename in slices:
 
+        if verbose > 0:
+            print "-" * 10
+            print "File:", filename
+            print "Size threshold:", min_blob_size
+            print "-" * 10
+
         # Load the slice
         image = nibabel.load(filename)
         array = image.get_data()
@@ -87,23 +94,41 @@ def otsu_binarization(slices, min_blob_size=100, prefix="o",
         mask = numpy.cast[numpy.uint8](mask) * 255
 
         # Compute connected components - filter small blob
-        blobs = {}
+        blob_sizes = []
         im_labels, nb_labels = ndimage.label(mask)
+        keep_labels = []
         for label in range(nb_labels):
             label_indices = numpy.where(im_labels==label)
             blob_size = len(label_indices[0])
             if blob_size <  min_blob_size:
                 im_labels[label_indices] = 0
             elif label != 0:
-                blobs[blob_size] = label
+                index = bisect.bisect(blob_sizes, blob_size)
+                keep_labels.insert(index, label)
+                blob_sizes.insert(index, blob_size)
 
-        # Get a mask built from the largest component
-        label = blobs[max(blobs.keys())]
+        # Get/apply a mask built from the two largest components
+        # label = blobs[max(blobs.keys())]
+        if len(keep_labels) <= 0 or len(keep_labels) > 2:
+            if len(keep_labels) > 2:
+                keep_labels = keep_labels[:2]
+            else: 
+                raise Exception(
+                    "One or two connected components are expected not '{0}'.".format(
+                    len(keep_labels)))
         smask = numpy.zeros(im_labels.shape, dtype=numpy.uint8)
-        smask[numpy.where(im_labels==label)] = 255
-
-        # Apply the previous mask to the input slice
-        array[numpy.where(smask==0)] = 0
+        arrays = []
+        ycenters = []
+        for label in keep_labels:
+            label_indices = numpy.where(im_labels==label)
+            ycenter = numpy.mean(label_indices[1])
+            index = bisect.bisect(ycenters, ycenter)
+            ycenters.insert(index, ycenter)
+            label_array = numpy.zeros(im_labels.shape, dtype=numpy.float)
+            label_array[label_indices] = array[label_indices]
+            arrays.insert(index, label_array)
+            smask[label_indices] = 255
+        array[numpy.where(smask == 0)] = 0
 
         if verbose > 1:
             # Callback to check mask
@@ -153,6 +178,17 @@ def otsu_binarization(slices, min_blob_size=100, prefix="o",
         masks.append(outfile + "-mask.tiff")
         smasks.append(outfile + "-smask.tiff")
         masked_slices.append(outfile + ".nii.gz")
+
+        # Save branches
+        component_prefix = ["-1", "-2"]
+        if len(arrays) == 2:
+            for index, array in enumerate(arrays):
+                outfile = os.path.join(
+                    output_directory, prefix + fname + component_prefix[index])
+                image = nibabel.Nifti1Image(array, affine)
+                nibabel.save(image, outfile + ".nii.gz")
+                image = Image.fromarray(numpy.cast[numpy.uint8](array))
+                image.save(outfile + ".tiff")
 
     return masked_slices, masks, smasks, labels
 
